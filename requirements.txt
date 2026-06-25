@@ -1,0 +1,6 @@
+# Basic Python dependencies for an Azure RAG application
+azure-identity
+azure-ai-openai
+python-dotenv
+requests
+langchain
