@@ -1,6 +1,16 @@
-# Basic Python dependencies for an Azure RAG application
+# Python dependencies for a more complete Azure RAG application
 azure-identity
+azure-core
+azure-storage-blob
+azure-keyvault-secrets
 openai
+langchain
 python-dotenv
 requests
-langchain
+tiktoken
+pydantic
+fastapi
+uvicorn
+pytest
+flake8
+pip-audit
