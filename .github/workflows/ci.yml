@@ -5,12 +5,17 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+  schedule:
+    - cron: '0 */6 * * *'
   workflow_dispatch:
 
 jobs:
   checks:
     name: Python lint and test
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.12']
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -18,7 +23,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python-version }}
 
       - name: Cache pip packages
         uses: actions/cache@v4
@@ -37,7 +42,7 @@ jobs:
 
       - name: Run Python lint
         run: |
-          if [ -d . ]; then flake8 . || true; fi
+          flake8 . || true
 
       - name: Run Python tests
         run: |
@@ -80,3 +85,31 @@ jobs:
             dist/**
             *.tar.gz
             *.whl
+
+  scheduled-poll:
+    name: Scheduled polling job
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install curl
+        run: sudo apt-get update && sudo apt-get install -y curl
+
+      - name: Poll configured URL
+        env:
+          POLL_URL: ${{ secrets.POLL_URL }}
+        run: |
+          if [ -z "$POLL_URL" ]; then
+            POLL_URL="https://www.githubstatus.com/"
+            echo "POLL_URL not set, using default: $POLL_URL"
+          else
+            echo "Polling configured URL: $POLL_URL"
+          fi
+          http_code=$(curl -s -o /dev/null -w "%{http_code}" "$POLL_URL")
+          echo "Received HTTP status: $http_code"
+          if [ "$http_code" -ge 400 ]; then
+            echo "Polling failed with HTTP status $http_code"
+            exit 1
+          fi
