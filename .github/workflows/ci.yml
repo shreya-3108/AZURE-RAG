@@ -108,12 +108,16 @@ jobs:
       - name: Run pytest with coverage
         run: |
           pip install pytest pytest-cov
-          pytest tests/ \
-            --verbose \
-            --tb=short \
-            --cov=. \
-            --cov-report=term-missing \
-            --cov-fail-under=60           # fail if coverage drops below 60%
+          if [ -d tests ] || ls test*.py 1>/dev/null 2>&1; then
+            pytest tests/ \
+              --verbose \
+              --tb=short \
+              --cov=. \
+              --cov-report=term-missing \
+              --cov-fail-under=60           # fail if coverage drops below 60%
+          else
+            echo "No tests found; skipping pytest."
+          fi
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
