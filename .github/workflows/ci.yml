@@ -1,115 +1,292 @@
-name: CI/CD
+# ============================================================
+#  CI/CD Pipeline — Azure RAG Business Report Assistant
+#  GitHub Actions | All 4 Labs Combined
+# ============================================================
+#
+#  REQUIRED GITHUB SECRETS (Settings → Secrets → Actions):
+#  ─────────────────────────────────────────────────────────
+#  AZURE_CLIENT_ID          → Service principal app (client) ID
+#  AZURE_TENANT_ID          → Azure AD tenant ID
+#  AZURE_SUBSCRIPTION_ID    → Azure subscription ID
+#  ACR_NAME                 → Azure Container Registry name (no .azurecr.io)
+#  AZURE_RESOURCE_GROUP     → Resource group name (e.g. rag-rg)
+#  STAGING_APP_NAME         → Container App name for staging (e.g. rag-app-staging)
+#  PROD_APP_NAME            → Container App name for production (e.g. rag-app-prod)
+#
+#  REQUIRED GITHUB ENVIRONMENTS (Settings → Environments):
+#  ─────────────────────────────────────────────────────────
+#  staging    → no protection rules needed
+#  production → enable "Required reviewers" for manual approval gate
+# ============================================================
 
+name: RAG CI/CD Pipeline
+
+# ────────────────────────────────────────────────────────────
+#  TRIGGERS
+#  Runs on every push to main and on all pull requests to main
+# ────────────────────────────────────────────────────────────
 on:
   push:
-    branches: [ main, master ]
+    branches: [main]
   pull_request:
-    branches: [ main, master ]
-  schedule:
-    - cron: '0 */6 * * *'
-  workflow_dispatch:
+    branches: [main]
 
+# ────────────────────────────────────────────────────────────
+#  GLOBAL ENV VARS
+#  Available in every job without repeating them
+# ────────────────────────────────────────────────────────────
+env:
+  PYTHON_VERSION: "3.11"
+  IMAGE_NAME: rag-app
+  WORKER_IMAGE_NAME: rag-worker
+
+# ============================================================
+#  JOBS — run in this order:
+#  lint → test → build-and-push → deploy-staging → deploy-production
+# ============================================================
 jobs:
-  checks:
-    name: Python lint and test
+
+  # ──────────────────────────────────────────────────────────
+  #  LAB 1 + LAB 2 (Part A): LINT
+  #  Checks code style and security issues before running tests
+  # ──────────────────────────────────────────────────────────
+  lint:
+    name: Lint & security scan
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ['3.12']
+
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip                          # caches pip deps between runs
 
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: python-${{ matrix.python-version }}-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            python-${{ matrix.python-version }}-
+      - name: Install lint tools
+        run: pip install flake8 bandit
 
-      - name: Install Python dependencies
+      - name: Run flake8 (code style)
         run: |
-          python --version
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest flake8
+          flake8 . \
+            --max-line-length=120 \
+            --exclude=.git,__pycache__,.venv \
+            --count \
+            --statistics
 
-      - name: Run Python lint
+      - name: Run bandit (security scan)
         run: |
-          flake8 . || true
+          bandit -r . \
+            --exclude ./.git,./.venv \
+            --severity-level medium \
+            --confidence-level medium
 
-      - name: Run Python tests
-        run: |
-          if [ -f pytest.ini ] || [ -d tests ] || ls test*.py 1>/dev/null 2>&1; then pytest --maxfail=1 --disable-warnings; fi
 
-      - name: Run dependency audit
-        run: |
-          python -m pip install pip-audit
-          if [ -f requirements.txt ]; then python -m pip_audit; fi
-
-  package:
-    name: Build Python package
+  # ──────────────────────────────────────────────────────────
+  #  LAB 2 (Part B): AUTOMATED TESTS
+  #  Runs pytest — pipeline blocks if any test fails
+  # ──────────────────────────────────────────────────────────
+  test:
+    name: Run tests
     runs-on: ubuntu-latest
-    needs: checks
-    if: github.event_name == 'push'
+    needs: lint                              # only runs if lint passes
+
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
 
-      - name: Install packaging dependencies
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pytest with coverage
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install build
+          pip install pytest pytest-cov
+          pytest tests/ \
+            --verbose \
+            --tb=short \
+            --cov=. \
+            --cov-report=term-missing \
+            --cov-fail-under=60           # fail if coverage drops below 60%
 
-      - name: Build package
-        run: |
-          if [ -f pyproject.toml ] || [ -f setup.py ]; then python -m build --sdist --wheel; fi
-
-      - name: Upload package artifact
-        if: always()
+      - name: Upload coverage report
         uses: actions/upload-artifact@v4
+        if: always()                         # upload even if tests fail
         with:
-          name: python-package
-          path: |
-            dist/**
-            *.tar.gz
-            *.whl
+          name: coverage-report
+          path: htmlcov/
+          retention-days: 7
 
-  scheduled-poll:
-    name: Scheduled polling job
+
+  # ──────────────────────────────────────────────────────────
+  #  LAB 3: BUILD & PUSH DOCKER IMAGES TO AZURE ACR
+  #  Builds both the app (Streamlit UI) and worker containers
+  #  Only runs on pushes to main (not on PRs)
+  # ──────────────────────────────────────────────────────────
+  build-and-push:
+    name: Build & push images to ACR
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
+    needs: test                              # only runs if tests pass
+    if: github.ref == 'refs/heads/main'     # skip on pull requests
+
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install curl
-        run: sudo apt-get update && sudo apt-get install -y curl
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Poll configured URL
-        env:
-          POLL_URL: ${{ secrets.POLL_URL }}
+      - name: Build & push Streamlit UI image
         run: |
-          if [ -z "$POLL_URL" ]; then
-            POLL_URL="https://www.githubstatus.com/"
-            echo "POLL_URL not set, using default: $POLL_URL"
+          az acr build \
+            --registry ${{ secrets.ACR_NAME }} \
+            --image ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            --image ${{ env.IMAGE_NAME }}:latest \
+            --file Dockerfile.app \
+            .
+
+      - name: Build & push worker image
+        run: |
+          az acr build \
+            --registry ${{ secrets.ACR_NAME }} \
+            --image ${{ env.WORKER_IMAGE_NAME }}:${{ github.sha }} \
+            --image ${{ env.WORKER_IMAGE_NAME }}:latest \
+            --file Dockerfile.worker \
+            .
+
+      - name: Print image tags
+        run: |
+          echo "App image:"
+          echo "  ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          echo "Worker image:"
+          echo "  ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.WORKER_IMAGE_NAME }}:${{ github.sha }}"
+
+
+  # ──────────────────────────────────────────────────────────
+  #  LAB 4 (Part A): DEPLOY TO STAGING
+  #  Deploys both containers to the staging environment
+  #  Uses the exact image SHA built above — no "latest" tag in deploys
+  # ──────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to staging
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: staging                     # maps to GitHub Environment named "staging"
+
+    steps:
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy UI to staging Container App
+        run: |
+          az containerapp update \
+            --name ${{ secrets.STAGING_APP_NAME }} \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --image ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Deploy worker to staging Container App
+        run: |
+          az containerapp update \
+            --name ${{ secrets.STAGING_APP_NAME }}-worker \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --image ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.WORKER_IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Run smoke test against staging
+        run: |
+          STAGING_URL=$(az containerapp show \
+            --name ${{ secrets.STAGING_APP_NAME }} \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" \
+            --output tsv)
+
+          echo "Staging URL: https://$STAGING_URL"
+
+          # Wait for app to be ready (up to 60 seconds)
+          for i in {1..12}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://$STAGING_URL")
+            if [ "$STATUS" = "200" ]; then
+              echo "Smoke test passed — HTTP $STATUS"
+              exit 0
+            fi
+            echo "Attempt $i: HTTP $STATUS — waiting 5s..."
+            sleep 5
+          done
+
+          echo "Smoke test failed — staging did not return HTTP 200"
+          exit 1
+
+
+  # ──────────────────────────────────────────────────────────
+  #  LAB 4 (Part B): DEPLOY TO PRODUCTION
+  #  Requires manual approval in GitHub (environment protection rule)
+  #  Only proceeds after staging smoke test passes
+  # ──────────────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy to production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment: production                  # maps to GitHub Environment "production"
+                                             # with Required Reviewers enabled
+
+    steps:
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy UI to production Container App
+        run: |
+          az containerapp update \
+            --name ${{ secrets.PROD_APP_NAME }} \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --image ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Deploy worker to production Container App
+        run: |
+          az containerapp update \
+            --name ${{ secrets.PROD_APP_NAME }}-worker \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --image ${{ secrets.ACR_NAME }}.azurecr.io/${{ env.WORKER_IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Verify production is live
+        run: |
+          PROD_URL=$(az containerapp show \
+            --name ${{ secrets.PROD_APP_NAME }} \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --query "properties.configuration.ingress.fqdn" \
+            --output tsv)
+
+          echo "Production URL: https://$PROD_URL"
+
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://$PROD_URL")
+          if [ "$STATUS" = "200" ]; then
+            echo "Production is live — HTTP $STATUS"
           else
-            echo "Polling configured URL: $POLL_URL"
-          fi
-          http_code=$(curl -s -o /dev/null -w "%{http_code}" "$POLL_URL")
-          echo "Received HTTP status: $http_code"
-          if [ "$http_code" -ge 400 ]; then
-            echo "Polling failed with HTTP status $http_code"
+            echo "Production check failed — HTTP $STATUS"
             exit 1
           fi
+
+      - name: Print deployment summary
+        run: |
+          echo "========================================"
+          echo "  Deployment complete"
+          echo "  Commit : ${{ github.sha }}"
+          echo "  Author : ${{ github.actor }}"
+          echo "  Branch : ${{ github.ref_name }}"
+          echo "========================================"
